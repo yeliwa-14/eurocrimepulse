@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.backup
+*.log
+.env
+.venv/
+venv/
+airflow/logs/
+logs/
+landing/
+streaming/landing/
+*.jsonl
+producer_state.json

@@ -1,0 +1,1668 @@
+"""
+EuroCrimePulse — Streamlit dashboard v4
+Aligned with the Star Schema and the Analysis notebook.
+
+Production entrypoint: streamlit_dashboard.py
+Run inside Docker with: streamlit run streamlit_dashboard.py --server.address 0.0.0.0 --server.port 8501
+"""
+
+import os
+import re
+import requests
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+# ClickHouse HTTP is used as the production data source; Spark local parquet is not used in production
+
+# ============================================================
+# THEME
+# ============================================================
+NAVY = "#102A43"
+NAVY_2 = "#243B53"
+RED = "#C1121F"
+RED_DARK = "#8D0801"
+GOLD = "#F4A261"
+BLUE = "#457B9D"
+GREEN = "#2A9D8F"
+BG = "#F5F7FA"
+CARD = "#FFFFFF"
+TEXT = "#102A43"
+MUTED = "#627D98"
+GRID = "#D9E2EC"
+MONTH_ORDER = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
+
+CANDIDATE_BASE_DIRS = [
+    os.environ.get("STAR_SCHEMA_DIR", ""),
+    "/content/drive/MyDrive/star_schema_spark",
+    "/content/drive/My Drive/star_schema_spark",
+    "star_schema_spark",
+]
+BASE_DIR = next(
+    (os.path.abspath(p) for p in CANDIDATE_BASE_DIRS if p and os.path.isdir(p)),
+    None,
+)
+
+TABLES = [
+    "dim_crime_type", "dim_city", "dim_geolocation", "dim_court",
+    "dim_judge", "dim_officer", "dim_sentence_type", "dim_verdict_type",
+    "dim_release_reason", "dim_victim", "dim_defendant", "dim_date",
+    "fact_crime_case",
+]
+
+st.set_page_config(
+    page_title="EuroCrimePulse | Crime Intelligence",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(f"""
+<style>
+.stApp {{ background: {BG}; color: {TEXT}; }}
+.block-container {{ max-width: 1500px; padding-top: 1.25rem; padding-bottom: 2.5rem; }}
+h1 {{ color: {NAVY}; font-weight: 800; letter-spacing: -0.5px; }}
+h2, h3 {{ color: {NAVY_2}; font-weight: 750; }}
+p, label, .stMarkdown {{ color: {TEXT}; }}
+section[data-testid="stSidebar"] {{ background: linear-gradient(180deg, {NAVY} 0%, #173B5E 100%); }}
+section[data-testid="stSidebar"] * {{ color: #F8FAFC !important; }}
+section[data-testid="stSidebar"] .stCaption {{ color: #CBD5E1 !important; }}
+div[data-testid="stMetric"] {{
+    background: {CARD}; border: 1px solid #E2E8F0; border-radius: 14px;
+    padding: 15px 18px; box-shadow: 0 3px 12px rgba(16,42,67,.06);
+    border-top: 4px solid {RED};
+}}
+div[data-testid="stMetricLabel"] {{ color: {MUTED}; font-weight: 650; }}
+div[data-testid="stMetricValue"] {{ color: {NAVY}; font-size: 1.55rem; font-weight: 800; }}
+.hero {{
+    background: linear-gradient(120deg, {NAVY} 0%, #173B5E 65%, {RED_DARK} 100%);
+    border-radius: 18px; padding: 23px 28px; margin-bottom: 20px;
+    color: white; box-shadow: 0 8px 24px rgba(16,42,67,.14);
+}}
+.hero h1, .hero p {{ color: white !important; margin: 0; }}
+.hero p {{ opacity: .86; margin-top: 6px; }}
+.insight-card {{
+    background: {CARD}; border: 1px solid #E2E8F0; border-left: 5px solid {GOLD};
+    border-radius: 12px; padding: 12px 15px; margin: 8px 0;
+    box-shadow: 0 2px 8px rgba(16,42,67,.04);
+}}
+.insight-title {{ color: {NAVY}; font-weight: 800; margin-bottom: 3px; }}
+.small-note {{ color: {MUTED}; font-size: .86rem; }}
+hr {{ border-color: #E2E8F0; }}
+.chart-gap {{ height: 10px; }}
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================
+# ClickHouse / Star Schema (production data source)
+# ============================================================
+def get_clickhouse_config():
+    """Return ClickHouse connection configuration.
+
+    Do not perform a separate health-check query here. The actual dashboard
+    query will validate connectivity and expose its own ClickHouse error.
+    """
+    CH_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
+    CH_PORT = int(os.getenv("CLICKHOUSE_PORT", "8123"))
+    CH_DB = os.getenv("CLICKHOUSE_DB", "eurocrimepulse")
+    CH_USER = os.getenv("CLICKHOUSE_USER", None)
+    CH_PASS = os.getenv("CLICKHOUSE_PASSWORD", None)
+
+    return {
+        "host": CH_HOST,
+        "port": CH_PORT,
+        "db": CH_DB,
+        "user": CH_USER,
+        "pass": CH_PASS,
+    }
+
+
+def _qualify_table_names(sql: str) -> str:
+    """Qualify plain table names (e.g., dim_date) with the ClickHouse DB schema (eurocrimepulse).
+
+    Only unqualified identifiers are rewritten (does not touch already qualified names).
+    """
+    cfg = get_clickhouse_config()
+    db = cfg["db"]
+    out = sql
+    for t in TABLES:
+        # Replace occurrences of the bare table name that are not already prefixed with a dot
+        pattern = rf"(?<![\.\w])\b{re.escape(t)}\b"
+        out = re.sub(pattern, f"{db}.{t}", out)
+    return out
+
+
+def q(sql: str) -> pd.DataFrame:
+    """Execute SQL against ClickHouse HTTP using GET, matching the verified curl path."""
+    cfg = get_clickhouse_config()
+    full_sql = _qualify_table_names(sql)
+
+    if "FORMAT" not in full_sql.upper():
+        full_sql = full_sql.rstrip() + " FORMAT JSON"
+
+    auth = (cfg["user"], cfg["pass"]) if cfg["user"] else None
+    url = f"http://{cfg['host']}:{cfg['port']}/"
+
+    try:
+        resp = requests.get(
+            url,
+            params={"query": full_sql},
+            timeout=30,
+            auth=auth,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        st.error(f"ClickHouse query failed: {exc}")
+        st.code(full_sql)
+        try:
+            st.code(resp.text)
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    data = payload.get("data", [])
+
+    if not data:
+        cols = [m["name"] for m in payload.get("meta", [])]
+        df = pd.DataFrame(columns=cols)
+    else:
+        df = pd.DataFrame(data)
+
+    return df
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def q_scalar(sql, default=None):
+    """Return the first cell of a query safely."""
+    df = q(sql)
+    if df is None or df.empty or df.shape[1] == 0:
+        return default
+    try:
+        return df.iloc[0, 0]
+    except Exception:
+        return default
+
+def sql_list(values):
+    if values is None:
+        return ""
+
+    if isinstance(values, (str, int, float)):
+        values = [values]
+
+    return ", ".join(
+        "'" + str(v).replace("'", "''") + "'"
+        for v in values
+    )
+
+
+def filters_sql(years, crime_types, countries, cities, date_alias="d"):
+    """Build a safe WHERE clause for the common crime-date filters."""
+    clauses = []
+    if years:
+        clauses.append(f"{date_alias}.year IN ({', '.join(map(str, years))})")
+    if crime_types:
+        clauses.append(f"ct.crime_type IN ({sql_list(crime_types)})")
+    if countries:
+        clauses.append(f"ci.country_name IN ({sql_list(countries)})")
+    if cities:
+        clauses.append(f"ci.city_name IN ({sql_list(cities)})")
+    return "WHERE " + " AND ".join(clauses) if clauses else ""
+
+
+def add_condition(where_clause, condition):
+    return f"{where_clause} AND {condition}" if where_clause else f"WHERE {condition}"
+
+
+def layout(fig, height=500, legend=True, hover="closest"):
+    fig.update_layout(
+        height=height,
+        paper_bgcolor=CARD,
+        plot_bgcolor=CARD,
+        font=dict(color=TEXT, family="Arial"),
+        margin=dict(l=55, r=30, t=50, b=50),
+        hovermode=hover,
+        showlegend=legend,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor=GRID, zeroline=False)
+    fig.update_yaxes(showgrid=False, zeroline=False)
+    return fig
+
+
+
+_chart_counter = 0
+
+YEAR_COLORS = [
+    RED,
+    NAVY,
+    GOLD,
+    BLUE,
+    GREEN,
+    "#9B5DE5",
+    "#F15BB5",
+    "#00BBF9",
+    "#00A896",
+    "#F77F00",
+]
+
+def _as_float_list(values):
+    out = []
+    for v in values:
+        try:
+            out.append(float(v))
+        except Exception:
+            out.append(0.0)
+    return out
+
+
+def _format_int_labels(values):
+    return [f"{int(round(float(v))):,}" for v in values]
+
+
+def _format_pct_labels(values, decimals=1):
+    out = []
+    for v in values:
+        try:
+            out.append(f"{float(v):.{decimals}f}%")
+        except Exception:
+            out.append("")
+    return out
+
+
+def show_chart(fig, height=500, legend=True, hover="closest"):
+    global _chart_counter
+    _chart_counter += 1
+
+    fig = layout(fig, height, legend=legend, hover=hover)
+
+    # Do not use texttemplate here.
+    # Labels are preformatted in each chart as plain strings.
+    st.plotly_chart(
+        fig,
+        key=f"plotly_chart_{_chart_counter}",
+    )
+
+    st.markdown(
+        '<div class="chart-gap"></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def hero(title, subtitle):
+    st.markdown(
+        f'<div class="hero"><h1>{title}</h1><p>{subtitle}</p></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def insight(title, text):
+    st.markdown(
+        f'<div class="insight-card"><div class="insight-title">{title}</div>{text}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+
+def pct_text(series):
+    """Return preformatted percentage labels for Plotly."""
+    return [f"{float(v):.1f}%" if pd.notna(v) else "" for v in series]
+
+
+def clean_num(value, default=0):
+    return default if pd.isna(value) else float(value)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+st.sidebar.markdown("#  EuroCrimePulse")
+st.sidebar.caption("Crime Intelligence • Star Schema • Spark SQL")
+page = st.sidebar.radio(
+    "Dashboard",
+    [
+        "1. Crime Overview & Trends",
+        "2. Geographic Distribution",
+        "3. Judiciary & Verdicts",
+        "4. Corrections & Demographics",
+    ],
+)
+
+filter_options = q("""
+SELECT DISTINCT d.year AS year
+FROM (
+    SELECT DISTINCT crime_date_key
+    FROM fact_crime_case
+) f
+ANY INNER JOIN dim_date d
+    ON f.crime_date_key = d.date_key
+WHERE d.year IS NOT NULL
+ORDER BY year
+""")
+
+if "year" in filter_options.columns:
+    year_options = [
+        int(x) for x in filter_options["year"].dropna().tolist()
+    ]
+else:
+    year_options = []
+crime_options = q("SELECT crime_type FROM dim_crime_type ORDER BY crime_type")["crime_type"].tolist()
+city_options_df = q("""
+SELECT DISTINCT city_name, country_name
+FROM dim_city
+ORDER BY country_name, city_name
+""")
+country_options = sorted(city_options_df["country_name"].dropna().unique().tolist())
+city_options = sorted(city_options_df["city_name"].dropna().unique().tolist())
+
+st.sidebar.markdown("### Global Filters")
+years = st.sidebar.multiselect("Crime Year", year_options, default=year_options)
+crime_types = st.sidebar.multiselect("Crime Type", crime_options, default=[])
+countries = st.sidebar.multiselect("Country", country_options, default=[])
+cities = st.sidebar.multiselect("City", city_options, default=[])
+
+st.sidebar.markdown('---')
+with st.sidebar.expander("Star Schema status"):
+    st.write(f"**Loaded:** {len(TABLES)}/{len(TABLES)} tables")
+    st.write("**Fact:** `fact_crime_case`")
+    # Dynamic counts from ClickHouse (fallback to placeholders on error)
+    try:
+        total_cases_df = q("SELECT COUNT() AS n FROM fact_crime_case")
+        total_cases = int(total_cases_df.iloc[0, 0]) if not total_cases_df.empty else 0
+    except Exception:
+        total_cases = None
+
+    try:
+        crime_types_df = q("SELECT COUNT(DISTINCT crime_type) AS n FROM dim_crime_type")
+        total_crime_types = int(crime_types_df.iloc[0, 0]) if not crime_types_df.empty else 0
+    except Exception:
+        total_crime_types = None
+
+    try:
+        cities_df = q("SELECT COUNT(DISTINCT city_name) AS n FROM dim_city")
+        total_cities = int(cities_df.iloc[0, 0]) if not cities_df.empty else 0
+    except Exception:
+        total_cities = None
+
+    try:
+        courts_df = q("SELECT COUNT(DISTINCT court_name) AS n FROM dim_court")
+        courts = int(courts_df.iloc[0, 0]) if not courts_df.empty else 0
+    except Exception:
+        courts = None
+
+    try:
+        judges_df = q("SELECT COUNT(DISTINCT judge_name) AS n FROM dim_judge")
+        judges = int(judges_df.iloc[0, 0]) if not judges_df.empty else 0
+    except Exception:
+        judges = None
+
+    st.write("**Cases:** " + (f"{total_cases:,}" if total_cases is not None else "—"))
+    st.write("**Crime types:** " + (f"{total_crime_types:,}" if total_crime_types is not None else "—"))
+    st.write("**Cities:** " + (f"{total_cities:,}" if total_cities is not None else "—"))
+    st.write("**Courts:** " + (f"{courts:,}" if courts is not None else "—"))
+    st.write("**Judges:** " + (f"{judges:,}" if judges is not None else "—"))
+
+WHERE = filters_sql(years, crime_types, countries, cities, date_alias="d")
+
+# ============================================================
+# 1. CRIME OVERVIEW & TRENDS
+# ============================================================
+if page.startswith("1"):
+    hero(
+        " Crime Overview & Trends",
+        "A high-level view of crime volume, seasonality, and crime-type patterns."
+    )
+
+    base_join = """
+        FROM fact_crime_case f
+        JOIN dim_date d ON f.crime_date_key = d.date_key
+        JOIN dim_crime_type ct ON f.crime_type_key = ct.crime_type_key
+        JOIN dim_city ci ON f.city_key = ci.city_key
+    """
+
+    total = q_scalar(f"SELECT COUNT(DISTINCT f.crime_case_key) AS n {base_join} {WHERE}")
+    types = q_scalar(f"SELECT COUNT(DISTINCT f.crime_type_key) AS n {base_join} {WHERE}")
+
+    monthly = q(f"""
+        SELECT d.year, d.month, d.month_name,
+               COUNT(DISTINCT f.crime_case_key) AS crime_count
+        {base_join} {WHERE}
+        GROUP BY d.year, d.month, d.month_name
+        ORDER BY d.year, d.month
+    """)
+
+    # The final month can be partial. Default to excluding it from the trend.
+    hide_partial = st.checkbox(
+        "Hide the final partial month from the trend",
+        value=True,
+        help="The latest month in the generated dataset may contain only part of the month."
+    )
+    trend_monthly = monthly.copy()
+    if hide_partial and not trend_monthly.empty:
+        latest_year = trend_monthly["year"].max()
+        latest_month = trend_monthly.loc[trend_monthly["year"].eq(latest_year), "month"].max()
+        trend_monthly = trend_monthly[
+            ~((trend_monthly["year"] == latest_year) & (trend_monthly["month"] == latest_month))
+        ]
+
+    avg_monthly = trend_monthly["crime_count"].mean() if not trend_monthly.empty else 0
+    common = q(f"""
+        SELECT ct.crime_type, COUNT(DISTINCT f.crime_case_key) AS crime_count
+        {base_join} {WHERE}
+        GROUP BY ct.crime_type
+        ORDER BY crime_count DESC
+        LIMIT 1
+    """)
+    common_name = common.iloc[0, 0] if not common.empty else "—"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Cases", f"{int(total):,}")
+    c2.metric("Crime Types", f"{int(types):,}")
+    c3.metric("Average Monthly Cases", f"{avg_monthly:,.0f}")
+    c4.metric("Most Common Crime", common_name)
+
+    st.markdown("###  Crime Activity Over Time")
+    level = st.selectbox("Time level", ["Month", "Year", "Day", "Day of Week"], index=0)
+
+    if level == "Month":
+        fig = px.line(
+            trend_monthly,
+            x="month_name", y="crime_count", color="year", markers=True,
+            category_orders={"month_name": MONTH_ORDER},
+            color_discrete_sequence=[RED, NAVY, GOLD, BLUE, GREEN],
+            labels={"month_name": "Month", "crime_count": "Cases", "year": "Year"},
+        )
+        fig.update_traces(line=dict(width=3))
+        fig.update_layout(hovermode="x unified")
+
+    elif level == "Year":
+        # Build yearly totals from the already loaded monthly data.
+        if monthly.empty:
+            yearly = pd.DataFrame(
+                {"year": [], "crime_count": []}
+            )
+        else:
+            yearly = (
+                monthly.groupby("year", as_index=False)["crime_count"]
+                .sum()
+                .sort_values("year")
+            )
+
+            yearly["year"] = pd.to_numeric(
+                yearly["year"], errors="coerce"
+            )
+            yearly["crime_count"] = pd.to_numeric(
+                yearly["crime_count"], errors="coerce"
+            )
+
+            yearly = yearly.dropna(
+                subset=["year", "crime_count"]
+            )
+
+        fig = go.Figure()
+
+        if not yearly.empty:
+            fig.add_trace(
+                go.Bar(
+                    x=yearly["year"].astype(int).astype(str).tolist(),
+                    y=yearly["crime_count"].astype(float).tolist(),
+                    text=[
+                        f"{int(v):,}"
+                        for v in yearly["crime_count"]
+                    ],
+                    textposition="outside",
+                    marker=dict(color=RED),
+                    hovertemplate=(
+                        "Year: %{x}<br>"
+                        "Cases: %{y:,}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+        fig.update_layout(
+            xaxis_title="Year",
+            yaxis_title="Cases",
+        )
+
+    elif level == "Day":
+        month_options = q(f"""
+            SELECT DISTINCT d.month, d.month_name
+            FROM fact_crime_case f
+            JOIN dim_date d ON f.crime_date_key=d.date_key
+            JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+            JOIN dim_city ci ON f.city_key=ci.city_key
+            {WHERE}
+            ORDER BY d.month
+        """)
+        if month_options.empty:
+            st.info("No month is available for the current filters.")
+            fig = go.Figure()
+        else:
+            selected_month = st.selectbox("Month", month_options["month_name"].tolist())
+            month_num = int(month_options.loc[
+                month_options.month_name.eq(selected_month), "month"
+            ].iloc[0])
+            day_where = add_condition(WHERE, f"d.month={month_num}")
+            day_df = q(f"""
+                SELECT d.year, DAY(d.full_date) AS day,
+                       COUNT(DISTINCT f.crime_case_key) AS crime_count
+                {base_join} {day_where}
+                GROUP BY d.year, DAY(d.full_date)
+                ORDER BY d.year, day
+            """)
+            fig = go.Figure()
+
+            year_colors = [
+                RED,
+                NAVY,
+                GOLD,
+                BLUE,
+                GREEN,
+                "#9B5DE5",
+                "#F15BB5",
+                "#00BBF9",
+            ]
+
+            if not day_df.empty:
+                day_df["year"] = pd.to_numeric(
+                    day_df["year"], errors="coerce"
+                )
+                day_df["day"] = pd.to_numeric(
+                    day_df["day"], errors="coerce"
+                )
+                day_df["crime_count"] = pd.to_numeric(
+                    day_df["crime_count"], errors="coerce"
+                )
+                day_df = day_df.dropna(
+                    subset=["year", "day", "crime_count"]
+                )
+
+                for i, year in enumerate(sorted(day_df["year"].unique())):
+                    part = day_df[day_df["year"] == year].sort_values("day")
+
+                    fig.add_trace(
+                        go.Bar(
+                            x=part["day"].astype(int).tolist(),
+                            y=part["crime_count"].astype(float).tolist(),
+                            name=str(int(year)),
+                            marker=dict(
+                                color=year_colors[i % len(year_colors)]
+                            ),
+                            text=[
+                                f"{int(v):,}"
+                                for v in part["crime_count"]
+                            ],
+                            textposition="outside",
+                            hovertemplate=(
+                                "Year: " + str(int(year)) +
+                                "<br>Day: %{x}" +
+                                "<br>Cases: %{y:,}" +
+                                "<extra></extra>"
+                            ),
+                        )
+                    )
+
+            fig.update_layout(
+                xaxis_title="Day of Month",
+                yaxis_title="Cases",
+                barmode="group",
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.01,
+                    xanchor="left",
+                    x=0,
+                ),
+            )
+
+    else:
+        dow = q(f"""
+            SELECT d.day_name, COUNT(DISTINCT f.crime_case_key) AS crime_count
+            {base_join} {WHERE}
+            GROUP BY d.day_name
+        """)
+        order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        dow["day_name"] = pd.Categorical(dow["day_name"], categories=order, ordered=True)
+        dow = dow.sort_values("day_name")
+        fig = px.bar(
+            dow, x="day_name", y="crime_count", text="crime_count",
+            color_discrete_sequence=[RED], labels={"day_name": "Day", "crime_count": "Cases"}
+        )
+        fig.update_traces( textposition="outside")
+
+    show_chart(fig, 570, legend=(level in ["Month", "Day"]), hover="x unified")
+
+    st.markdown("###  Crime Type Distribution")
+    crime_share = q(f"""
+        WITH x AS (
+            SELECT ct.crime_type, COUNT(DISTINCT f.crime_case_key) AS crime_count
+            {base_join} {WHERE}
+            GROUP BY ct.crime_type
+        )
+        SELECT crime_type, crime_count,
+               ROUND(crime_count*100.0/SUM(crime_count) OVER(),2) AS share_pct
+        FROM x
+        ORDER BY crime_count DESC
+    """)
+    crime_share = crime_share.sort_values("crime_count").copy()
+    crime_share["share_label"] = pct_text(crime_share["share_pct"])
+
+    fig = px.bar(
+        crime_share,
+        x="crime_count", y="crime_type", orientation="h", text="share_label",
+        color="crime_count",
+        color_continuous_scale=[[0, "#F6BD60"], [.5, "#E85D04"], [1, RED_DARK]],
+        labels={"crime_count": "Cases", "crime_type": ""},
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(coloraxis_showscale=False)
+    show_chart(fig, 570, legend=False)
+
+    # Dynamic insights
+    st.markdown("###  Key Insights")
+    if not crime_share.empty:
+        top = crime_share.iloc[0]
+        bottom = crime_share.iloc[-1]
+        insight(
+            "Most common crime",
+            f"<b>{top.crime_type}</b> accounts for <b>{top.share_pct:.2f}%</b> of cases in the current filter selection."
+        )
+        insight(
+            "Least common crime",
+            f"<b>{bottom.crime_type}</b> has the smallest share at <b>{bottom.share_pct:.2f}%</b>."
+        )
+    if not trend_monthly.empty:
+        peak = trend_monthly.loc[trend_monthly.crime_count.idxmax()]
+        insight(
+            "Peak month",
+            f"<b>{peak.month_name} {int(peak.year)}</b> has the highest completed-month volume: <b>{int(peak.crime_count):,} cases</b>."
+        )
+
+    st.markdown("###  Monthly Analysis")
+    st.dataframe(
+        monthly.sort_values(["year", "month"], ascending=[False, False]),
+        
+        
+    )
+
+# ============================================================
+# 2. GEOGRAPHIC DISTRIBUTION
+# ============================================================
+elif page.startswith("2"):
+    hero(
+        "Geographic Distribution",
+        "Where crime happens, how city profiles differ, and where the biggest changes occur."
+    )
+
+    joins = """
+      FROM fact_crime_case f
+      JOIN dim_city ci ON f.city_key=ci.city_key
+      JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+      JOIN dim_date d ON f.crime_date_key=d.date_key
+    """
+
+    # ------------------------------------------------------------
+    # City-level dataset: one ClickHouse scan only.
+    # Use ANY JOIN to avoid multiplication from duplicate dimension rows.
+    # ------------------------------------------------------------
+    city_level = q(f"""
+      SELECT
+          ci.city_name,
+          ci.country_name,
+          uniqExact(f.crime_case_key) AS crime_count
+      FROM fact_crime_case f
+      ANY INNER JOIN dim_city ci
+        ON f.city_key = ci.city_key
+      ANY INNER JOIN dim_crime_type ct
+        ON f.crime_type_key = ct.crime_type_key
+      ANY INNER JOIN dim_date d
+        ON f.crime_date_key = d.date_key
+      {WHERE}
+      GROUP BY
+          ci.city_name,
+          ci.country_name
+      ORDER BY
+          crime_count DESC
+    """)
+
+    required_city_cols = {
+        "city_name",
+        "country_name",
+        "crime_count",
+    }
+
+    if (
+        city_level.empty
+        or not required_city_cols.issubset(city_level.columns)
+    ):
+        top = pd.DataFrame(
+            columns=[
+                "city_name",
+                "country_name",
+                "crime_count",
+            ]
+        )
+        avg_city = None
+    else:
+        city_level["crime_count"] = pd.to_numeric(
+            city_level["crime_count"],
+            errors="coerce",
+        )
+
+        city_level = city_level.dropna(
+            subset=["city_name", "crime_count"]
+        )
+
+        top = (
+            city_level
+            .sort_values("crime_count", ascending=False)
+            .head(10)
+            .copy()
+        )
+
+        avg_city = (
+            float(city_level["crime_count"].mean())
+            if not city_level.empty
+            else None
+        )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cities in View", len(top))
+    c2.metric(
+        "Top Crime City",
+        str(top.iloc[0]["city_name"])
+        if not top.empty
+        else "—",
+    )
+    c3.metric(
+        "Avg. Cases / City",
+        f"{avg_city:,.0f}"
+        if avg_city is not None
+        else "—",
+    )
+
+    # Two medium charts side by side.
+    city_col, yoy_col = st.columns(2, gap="large")
+
+    with city_col:
+        st.markdown("### Top 10 Cities by Case Volume")
+
+        if top.empty:
+            st.info(
+                "No city case-volume data is available "
+                "for the current filters."
+            )
+        else:
+            plot_top = top.sort_values(
+                "crime_count"
+            ).copy()
+
+            fig = go.Figure(
+                go.Bar(
+                    x=[
+                        float(v)
+                        for v in plot_top["crime_count"]
+                    ],
+                    y=plot_top["city_name"].astype(str).tolist(),
+                    orientation="h",
+                    text=[
+                        f"{int(v):,}"
+                        for v in plot_top["crime_count"]
+                    ],
+                    textposition="outside",
+                    marker=dict(
+                        color=[
+                            RED,
+                            NAVY,
+                            GOLD,
+                            BLUE,
+                            GREEN,
+                        ][:len(plot_top)]
+                    ),
+                    customdata=plot_top[
+                        "country_name"
+                    ].astype(str).tolist(),
+                    hovertemplate=(
+                        "City: %{y}<br>"
+                        "Country: %{customdata}<br>"
+                        "Cases: %{x:,}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+            fig.update_layout(
+                xaxis_title="Cases",
+                yaxis_title="",
+            )
+
+            show_chart(
+                fig,
+                520,
+                legend=False,
+            )
+
+    # Keep the complete YoY dataset for the insight section.
+    city_change = q(f"""
+      WITH cy AS (
+        SELECT ci.city_name, ci.country_name, d.year,
+               COUNT(DISTINCT f.crime_case_key) AS crime_count
+        {joins} {WHERE}
+        GROUP BY ci.city_name, ci.country_name, d.year
+      ), lagged AS (
+        SELECT *,
+               LAG(crime_count) OVER(
+                   PARTITION BY city_name,country_name ORDER BY year
+               ) previous_year_cases
+        FROM cy
+      )
+      SELECT *,
+             ROUND((crime_count-previous_year_cases)*100.0/previous_year_cases,2) change_pct
+      FROM lagged
+      WHERE previous_year_cases IS NOT NULL AND previous_year_cases > 0
+    """)
+
+    with yoy_col:
+        st.markdown("### Largest Year-over-Year Changes")
+        preview = city_change.reindex(
+            city_change.change_pct.abs().sort_values(ascending=False).index
+        ).head(10)
+        if preview.empty:
+            st.info("No year-over-year comparison is available for the current filters.")
+        else:
+            preview = preview.sort_values("change_pct").copy()
+            preview["yoy_label"] = _format_pct_labels(preview["change_pct"])
+
+            fig = go.Figure(
+                go.Bar(
+                    x=_as_float_list(preview["change_pct"]),
+                    y=preview["city_name"].astype(str).tolist(),
+                    orientation="h",
+                    text=preview["yoy_label"].tolist(),
+                    textposition="outside",
+                    marker=dict(
+                        color=[
+                            RED if float(v) >= 0 else BLUE
+                            for v in preview["change_pct"]
+                        ]
+                    ),
+                    hovertemplate=(
+                        "City: %{y}<br>"
+                        "YoY Change: %{x:.1f}%"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+            fig.update_layout(
+                xaxis_title="YoY Change (%)",
+                yaxis_title="",
+            )
+
+            show_chart(fig, 520, legend=False)
+
+    # Large chart: full width for readability.
+    st.markdown("### Crime Type × City")
+
+    top_names = (
+        top["city_name"].astype(str).tolist()
+        if not top.empty and "city_name" in top.columns
+        else []
+    )
+
+    if not top_names:
+        st.info("No city data is available for the current filters.")
+    else:
+        city_mix = q(f"""
+          SELECT
+              ci.city_name,
+              ct.crime_type,
+              COUNT(DISTINCT f.crime_case_key) AS crime_count
+          {joins} {WHERE}
+          AND ci.city_name IN ({sql_list(top_names)})
+          GROUP BY ci.city_name, ct.crime_type
+          ORDER BY ci.city_name, crime_count DESC
+        """)
+
+        if city_mix.empty:
+            st.info("No city × crime data is available for the current filters.")
+        else:
+            city_mix = city_mix.copy()
+
+            city_mix["crime_count"] = pd.to_numeric(
+                city_mix["crime_count"],
+                errors="coerce"
+            )
+            city_mix = city_mix.dropna(
+                subset=["crime_count"]
+            )
+
+            # Keep the top crime types across the displayed cities
+            # to avoid an unreadable 13 × 10 dense chart.
+            top_crimes = (
+                city_mix.groupby("crime_type")["crime_count"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(10)
+                .index
+                .tolist()
+            )
+
+            plot_df = city_mix[
+                city_mix["crime_type"].isin(top_crimes)
+            ].copy()
+
+            if plot_df.empty:
+                st.info(
+                    "No Crime Type × City data is available "
+                    "for the current filters."
+                )
+            else:
+                plot_df["city_name"] = plot_df["city_name"].astype(str)
+                plot_df["crime_type"] = plot_df["crime_type"].astype(str)
+
+                # Explicit Plotly chart, same approach used for Year.
+                fig = go.Figure()
+
+                chart_colors = [
+                    RED,
+                    NAVY,
+                    GOLD,
+                    BLUE,
+                    GREEN,
+                    "#9B5DE5",
+                    "#F15BB5",
+                    "#00BBF9",
+                    "#00A896",
+                    "#F77F00",
+                ]
+
+                for i, crime in enumerate(top_crimes):
+                    part = (
+                        plot_df[plot_df["crime_type"] == crime]
+                        .set_index("city_name")
+                        .reindex(top_names)
+                        .fillna(0)
+                        .reset_index()
+                    )
+
+                    fig.add_trace(
+                        go.Bar(
+                            name=crime,
+                            x=part["city_name"].tolist(),
+                            y=[
+                                float(v)
+                                for v in part["crime_count"].tolist()
+                            ],
+                            marker=dict(
+                                color=chart_colors[
+                                    i % len(chart_colors)
+                                ]
+                            ),
+                            hovertemplate=(
+                                "City: %{x}<br>"
+                                f"Crime Type: {crime}<br>"
+                                "Cases: %{y:,}"
+                                "<extra></extra>"
+                            ),
+                        )
+                    )
+
+                fig.update_layout(
+                    xaxis_title="City",
+                    yaxis_title="Cases",
+                    barmode="group",
+                    showlegend=True,
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="left",
+                        x=0,
+                    ),
+                    xaxis=dict(
+                        categoryorder="array",
+                        categoryarray=top_names,
+                    ),
+                )
+
+                show_chart(
+                    fig,
+                    610,
+                    legend=True,
+                    hover="x unified",
+                )
+
+    st.markdown("### Year-over-Year Detail")
+    tab1, tab2 = st.tabs(["Largest Positive Changes", "Largest Absolute Changes"])
+    positive = city_change.sort_values("change_pct", ascending=False).head(10)
+    absolute = city_change.reindex(
+        city_change.change_pct.abs().sort_values(ascending=False).index
+    ).head(10)
+    for tab, df in [(tab1, positive), (tab2, absolute)]:
+        with tab:
+            if df.empty:
+                st.info("No year-over-year comparison is available for the current filters.")
+            else:
+                df = df.sort_values("change_pct").copy()
+                df["yoy_label"] = _format_pct_labels(df["change_pct"])
+
+                fig = go.Figure(
+                    go.Bar(
+                        x=_as_float_list(df["change_pct"]),
+                        y=df["city_name"].astype(str).tolist(),
+                        orientation="h",
+                        text=df["yoy_label"].tolist(),
+                        textposition="outside",
+                        marker=dict(
+                            color=[
+                                RED if float(v) >= 0 else BLUE
+                                for v in df["change_pct"]
+                            ]
+                        ),
+                        hovertemplate=(
+                            "City: %{y}<br>"
+                            "YoY Change: %{x:.1f}%"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+
+                fig.update_layout(
+                    xaxis_title="YoY Change (%)",
+                    yaxis_title="",
+                )
+
+                show_chart(fig, 500, legend=False)
+
+    st.markdown("### Key Insights")
+    if not top.empty:
+        t = top.iloc[0]
+        insight(
+            "Top hotspot",
+            f"<b>{t.city_name}</b> ({t.country_name}) has the highest case volume in the current selection with <b>{int(t.crime_count):,} cases</b>."
+        )
+    if not city_change.empty:
+        biggest = city_change.loc[city_change.change_pct.idxmax()]
+        insight(
+            "Largest positive YoY change",
+            f"<b>{biggest.city_name}</b> shows the largest positive year-over-year change in the selected data: <b>{biggest.change_pct:.1f}%</b>."
+        )
+        insight(
+            "Interpretation note",
+            "Year-over-year percentages can be exaggerated when the previous year contains only a partial period. Use the absolute-change view and the filters together before drawing conclusions."
+        )
+
+# 3. JUDICIARY & VERDICTS
+# ============================================================
+elif page.startswith("3"):
+    hero(
+        "Judiciary & Verdicts",
+        "How cases are decided, how long they take, and how courts and sentences differ by crime."
+    )
+
+    joins = """
+      FROM fact_crime_case f
+      JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+      JOIN dim_city ci ON f.city_key=ci.city_key
+      JOIN dim_date d ON f.crime_date_key=d.date_key
+    """
+
+    verdicts = q(f"""
+      SELECT vt.verdict_type,
+             COUNT(DISTINCT f.crime_case_key) AS case_count
+      FROM fact_crime_case f
+      JOIN dim_verdict_type vt ON f.verdict_type_key=vt.verdict_type_key
+      JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+      JOIN dim_city ci ON f.city_key=ci.city_key
+      JOIN dim_date d ON f.crime_date_key=d.date_key
+      {WHERE}
+      GROUP BY vt.verdict_type
+      ORDER BY case_count DESC
+    """)
+
+    total_adj = int(verdicts.case_count.sum()) if not verdicts.empty else 0
+    guilty = int(verdicts.loc[verdicts.verdict_type.eq("Guilty"), "case_count"].sum()) if not verdicts.empty else 0
+    not_guilty = int(verdicts.loc[verdicts.verdict_type.eq("Not Guilty"), "case_count"].sum()) if not verdicts.empty else 0
+    conviction_rate = guilty * 100.0 / (guilty + not_guilty) if (guilty + not_guilty) else 0
+
+    top_court = q(f"""
+      SELECT c.court_name, COUNT(DISTINCT f.crime_case_key) AS case_count
+      FROM fact_crime_case f
+      JOIN dim_court c ON f.court_key=c.court_key
+      JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+      JOIN dim_city ci ON f.city_key=ci.city_key
+      JOIN dim_date d ON f.crime_date_key=d.date_key
+      {WHERE}
+      GROUP BY c.court_name
+      ORDER BY case_count DESC
+      LIMIT 1
+    """)
+
+    WHERE_CD = filters_sql(years, crime_types, countries, cities, date_alias="cd")
+    avg_days = q_scalar(f"""
+      WITH case_level AS (
+        SELECT
+            crime_case_key,
+            any(crime_type_key) AS crime_type_key,
+            any(city_key) AS city_key,
+            any(crime_date_key) AS crime_date_key,
+            any(verdict_date_key) AS verdict_date_key
+        FROM fact_crime_case
+        GROUP BY crime_case_key
+      )
+      SELECT AVG(dateDiff('day', cd.full_date, vd.full_date)) AS avg_days
+      FROM case_level f
+      ANY INNER JOIN dim_date cd
+        ON f.crime_date_key = cd.date_key
+      ANY INNER JOIN dim_date vd
+        ON f.verdict_date_key = vd.date_key
+      ANY INNER JOIN dim_crime_type ct
+        ON f.crime_type_key = ct.crime_type_key
+      ANY INNER JOIN dim_city ci
+        ON f.city_key = ci.city_key
+      {WHERE_CD}
+      AND f.verdict_date_key IS NOT NULL
+      AND f.crime_date_key IS NOT NULL
+      AND vd.full_date >= cd.full_date
+    """)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Adjudicated Cases", f"{total_adj:,}")
+    c2.metric("Conviction Rate", f"{conviction_rate:.1f}%")
+    c3.metric("Busiest Court", top_court.iloc[0].court_name if not top_court.empty else "—")
+    c4.metric("Avg. Days to Verdict", f"{avg_days:,.0f}" if pd.notna(avg_days) else "—")
+
+    # Two compact charts side by side.
+    verdict_col, sentence_type_col = st.columns(2, gap="large")
+    with verdict_col:
+        st.markdown("### Verdict Distribution")
+        fig = px.pie(
+            verdicts,
+            names="verdict_type",
+            values="case_count",
+            hole=.5,
+            color_discrete_sequence=[RED, NAVY, GOLD, BLUE, GREEN],
+        )
+
+        fig.update_traces(
+            textinfo="label+percent",
+            hoverinfo="label+value+percent",
+            hovertemplate=(
+                "Verdict: %{label}<br>"
+                "Cases: %{value:,}<br>"
+                "Share: %{percent}"
+                "<extra></extra>"
+            ),
+        )
+        show_chart(fig, 460, legend=True)
+
+    with sentence_type_col:
+        st.markdown("### Sentence Type Distribution")
+        sentence_types = q(f"""
+          SELECT stp.sentence_type,
+                 COUNT(DISTINCT f.crime_case_key) AS case_count
+          FROM fact_crime_case f
+          JOIN dim_sentence_type stp ON f.sentence_type_key=stp.sentence_type_key
+          JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+          JOIN dim_city ci ON f.city_key=ci.city_key
+          JOIN dim_date d ON f.crime_date_key=d.date_key
+          {WHERE}
+          GROUP BY stp.sentence_type
+          ORDER BY case_count DESC
+        """)
+        if not sentence_types.empty:
+            fig = px.bar(
+                sentence_types.sort_values("case_count"),
+                x="case_count", y="sentence_type", orientation="h", text="case_count",
+                color_discrete_sequence=[GOLD],
+                labels={"case_count": "Cases", "sentence_type": ""},
+            )
+            fig.update_traces(textposition="outside")
+            show_chart(fig, 460, legend=False)
+
+    # Large: percentage composition is easier to read than a raw-count heatmap.
+    st.markdown("### Verdict Outcome by Crime Type")
+    crime_verdict = q(f"""
+      SELECT ct.crime_type, vt.verdict_type,
+             COUNT(DISTINCT f.crime_case_key) AS case_count
+      FROM fact_crime_case f
+      JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+      JOIN dim_verdict_type vt ON f.verdict_type_key=vt.verdict_type_key
+      JOIN dim_city ci ON f.city_key=ci.city_key
+      JOIN dim_date d ON f.crime_date_key=d.date_key
+      {WHERE}
+      GROUP BY ct.crime_type, vt.verdict_type
+    """)
+    if not crime_verdict.empty:
+        pivot = crime_verdict.pivot_table(
+            index="crime_type", columns="verdict_type", values="case_count",
+            aggfunc="sum", fill_value=0
+        )
+        for col in ["Guilty", "Not Guilty", "Unknown"]:
+            if col not in pivot.columns:
+                pivot[col] = 0
+        pivot = pivot[["Guilty", "Not Guilty", "Unknown"]]
+        pct = pivot.div(pivot.sum(axis=1).replace(0, 1), axis=0) * 100
+        pct = pct.sort_values("Guilty")
+        stacked = pct.reset_index().melt(
+            id_vars="crime_type", var_name="verdict_type", value_name="share_pct"
+        )
+        fig = px.bar(
+            stacked, x="share_pct", y="crime_type", color="verdict_type",
+            orientation="h", barmode="stack", text="share_pct",
+            category_orders={"verdict_type": ["Guilty", "Not Guilty", "Unknown"]},
+            color_discrete_sequence=[RED, NAVY, GOLD],
+            labels={"share_pct": "Share of Cases (%)", "crime_type": "", "verdict_type": "Verdict"},
+        )
+        fig.update_traces(
+            textposition="inside",
+            hovertemplate="%{y}<br>%{fullData.name}: %{x:.1f}%<extra></extra>"
+        )
+        fig.update_xaxes(range=[0, 100])
+        show_chart(fig, 620, legend=True)
+
+    # Large horizontal bars: 13 crime types need the full width.
+    st.markdown("### Average Days to Verdict by Crime Type")
+    days_to = q(f"""
+      SELECT ct.crime_type,
+             COUNT(DISTINCT f.crime_case_key) AS case_count,
+             ROUND(AVG(dateDiff('day', cd.full_date, vd.full_date)),2) AS avg_days_to_verdict
+      FROM fact_crime_case f
+      JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+      JOIN dim_city ci ON f.city_key=ci.city_key
+      JOIN dim_date cd ON f.crime_date_key=cd.date_key
+      JOIN dim_date vd ON f.verdict_date_key=vd.date_key
+      {WHERE_CD}
+      AND f.verdict_date_key IS NOT NULL
+      AND f.crime_date_key IS NOT NULL
+      AND vd.full_date>=cd.full_date
+      GROUP BY ct.crime_type
+      ORDER BY avg_days_to_verdict DESC
+    """)
+    if not days_to.empty:
+        fig = px.bar(
+            days_to.sort_values("avg_days_to_verdict"),
+            x="avg_days_to_verdict", y="crime_type", orientation="h",
+            text="avg_days_to_verdict", color_discrete_sequence=[NAVY],
+            labels={"avg_days_to_verdict": "Days", "crime_type": ""},
+        )
+        fig.update_traces( textposition="outside")
+        show_chart(fig, 570, legend=False)
+
+    st.markdown("### Average Sentence Duration by Crime Type")
+    sentence = q(f"""
+      SELECT ct.crime_type,
+             COUNT(DISTINCT f.crime_case_key) AS case_count,
+             ROUND(AVG(f.sentence_duration),2) AS avg_sentence_duration
+      FROM fact_crime_case f
+      JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+      JOIN dim_city ci ON f.city_key=ci.city_key
+      JOIN dim_date d ON f.crime_date_key=d.date_key
+      {WHERE}
+      AND f.sentence_duration IS NOT NULL
+      AND f.is_duration_invalid_flag=false
+      GROUP BY ct.crime_type
+      ORDER BY avg_sentence_duration DESC
+    """)
+    if not sentence.empty:
+        fig = px.bar(
+            sentence.sort_values("avg_sentence_duration"),
+            x="avg_sentence_duration", y="crime_type", orientation="h",
+            text="avg_sentence_duration", color_discrete_sequence=[RED],
+            labels={"avg_sentence_duration": "Average Duration (days)", "crime_type": ""},
+        )
+        fig.update_traces( textposition="outside")
+        show_chart(fig, 570, legend=False)
+
+    st.markdown("### Top 10 Courts by Case Volume")
+    courts = q(f"""
+      SELECT c.court_name, COUNT(DISTINCT f.crime_case_key) AS case_count
+      FROM fact_crime_case f
+      JOIN dim_court c ON f.court_key=c.court_key
+      JOIN dim_crime_type ct ON f.crime_type_key=ct.crime_type_key
+      JOIN dim_city ci ON f.city_key=ci.city_key
+      JOIN dim_date d ON f.crime_date_key=d.date_key
+      {WHERE}
+      GROUP BY c.court_name
+      ORDER BY case_count DESC
+      LIMIT 10
+    """)
+    if not courts.empty:
+        fig = px.bar(
+            courts.sort_values("case_count"),
+            x="case_count", y="court_name", orientation="h", text="case_count",
+            color_discrete_sequence=[NAVY], labels={"case_count": "Cases", "court_name": ""},
+        )
+        fig.update_traces(textposition="outside")
+        show_chart(fig, 570, legend=False)
+
+    st.markdown("### Top Courts — Yearly Workload")
+
+    court_year = q("""
+        SELECT
+            c.court_name,
+            d.year,
+            uniqExact(f.crime_case_key) AS case_count
+        FROM fact_crime_case f
+        ANY INNER JOIN dim_court c
+            ON f.court_key = c.court_key
+        ANY INNER JOIN dim_date d
+            ON f.crime_date_key = d.date_key
+        GROUP BY c.court_name, d.year
+        ORDER BY case_count DESC
+    """)
+
+    if (
+        court_year.empty
+        or not {"court_name", "year", "case_count"}.issubset(court_year.columns)
+    ):
+        st.info("No yearly court workload is available.")
+    else:
+        court_year["year"] = pd.to_numeric(
+            court_year["year"], errors="coerce"
+        )
+        court_year["case_count"] = pd.to_numeric(
+            court_year["case_count"], errors="coerce"
+        )
+        court_year = court_year.dropna(
+            subset=["court_name", "year", "case_count"]
+        )
+
+        top_names = (
+            court_year.groupby("court_name")["case_count"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+            .index
+            .tolist()
+        )
+
+        court_year = court_year[
+            court_year["court_name"].isin(top_names)
+        ]
+
+        pivot = court_year.pivot_table(
+            index="court_name",
+            columns="year",
+            values="case_count",
+            aggfunc="sum",
+            fill_value=0,
+        )
+
+        if pivot.empty:
+            st.info("No yearly court workload is available.")
+        else:
+            full_names = pivot.index.astype(str).tolist()
+
+            def short_court(name, n=25):
+                return name if len(name) <= n else name[:n-3] + "..."
+
+            display_names = [short_court(x) for x in full_names]
+
+            fig = go.Figure(
+                go.Heatmap(
+                    z=pivot.values,
+                    x=[str(int(x)) for x in pivot.columns],
+                    y=display_names,
+                    customdata=[
+                        [name] * len(pivot.columns)
+                        for name in full_names
+                    ],
+                    colorscale=[
+                        [0, "#F8FAFC"],
+                        [.35, "#F4A261"],
+                        [.7, "#E85D04"],
+                        [1, RED_DARK],
+                    ],
+                    hovertemplate=(
+                        "Court: %{customdata}<br>"
+                        "Year: %{x}<br>"
+                        "Cases: %{z:,}"
+                        "<extra></extra>"
+                    ),
+                    colorbar_title="Cases",
+                )
+            )
+
+            fig.update_layout(
+                xaxis_title="Year",
+                yaxis_title="Court",
+            )
+
+            show_chart(fig, 620, legend=False)
+
+    # Safe defaults so Corrections always opens.
+    rates = pd.DataFrame(
+        columns=[
+            "crime_type",
+            "total_cases",
+            "imprisoned_cases",
+            "imprisonment_rate_pct",
+        ]
+    )
+    release = pd.DataFrame(
+        columns=["release_reason", "released_cases"]
+    )
+
+    # Release Trend
+    # ========================================================
+
+    st.markdown("### Release Trend")
+
+    release_joins = """
+      FROM fact_crime_case f
+      ANY INNER JOIN dim_date rd
+        ON f.release_date_key = rd.date_key
+    """
+
+    release_conditions = [
+        f"rd.year IN ({sql_list(years)})",
+        "f.release_date_key IS NOT NULL",
+    ]
+
+    if crime_types:
+        release_joins += """
+          ANY INNER JOIN dim_crime_type ct
+            ON f.crime_type_key = ct.crime_type_key
+        """
+        release_conditions.append(
+            f"ct.crime_type IN ({sql_list(crime_types)})"
+        )
+
+    if countries or cities:
+        release_joins += """
+          ANY INNER JOIN dim_city ci
+            ON f.city_key = ci.city_key
+        """
+
+        if countries:
+            release_conditions.append(
+                f"ci.country_name IN ({sql_list(countries)})"
+            )
+
+        if cities:
+            release_conditions.append(
+                f"ci.city_name IN ({sql_list(cities)})"
+            )
+
+    release_where = " AND ".join(release_conditions)
+
+    reltrend = q(f"""
+      SELECT
+          rd.year,
+          rd.month,
+          rd.month_name,
+          uniqExact(f.crime_case_key) AS released_cases
+      {release_joins}
+      WHERE {release_where}
+      GROUP BY
+          rd.year,
+          rd.month,
+          rd.month_name
+      ORDER BY
+          rd.year,
+          rd.month
+    """)
+
+    required_release_cols = {
+        "year",
+        "month",
+        "month_name",
+        "released_cases",
+    }
+
+    if (
+        reltrend.empty
+        or not required_release_cols.issubset(reltrend.columns)
+    ):
+        st.info(
+            "No release-trend data is available "
+            "for the current filters."
+        )
+    else:
+        reltrend = reltrend.copy()
+
+        reltrend["year"] = pd.to_numeric(
+            reltrend["year"],
+            errors="coerce",
+        )
+        reltrend["released_cases"] = pd.to_numeric(
+            reltrend["released_cases"],
+            errors="coerce",
+        )
+
+        reltrend = reltrend.dropna(
+            subset=[
+                "year",
+                "month_name",
+                "released_cases",
+            ]
+        )
+
+        if reltrend.empty:
+            st.info(
+                "No release-trend data is available "
+                "for the current filters."
+            )
+        else:
+            fig = px.line(
+                reltrend,
+                x="month_name",
+                y="released_cases",
+                color="year",
+                markers=True,
+                color_discrete_sequence=[
+                    RED,
+                    NAVY,
+                    GOLD,
+                    BLUE,
+                    GREEN,
+                ],
+                category_orders={
+                    "month_name": MONTH_ORDER
+                },
+                labels={
+                    "month_name": "Month",
+                    "released_cases": "Released Cases",
+                    "year": "Year",
+                },
+            )
+
+            fig.update_traces(
+                line=dict(width=3),
+                hovertemplate=(
+                    "Year: %{fullData.name}<br>"
+                    "Month: %{x}<br>"
+                    "Released Cases: %{y:,}"
+                    "<extra></extra>"
+                ),
+            )
+
+            show_chart(
+                fig,
+                570,
+                legend=True,
+                hover="x unified",
+            )
+
+    st.markdown("###  Victim vs Defendant Average Age")
+    demo = q(f"""
+      WITH case_level AS (
+        SELECT
+            crime_case_key,
+            any(crime_type_key) AS crime_type_key,
+            any(city_key) AS city_key,
+            any(crime_date_key) AS crime_date_key,
+            any(victim_key) AS victim_key,
+            any(defendant_key) AS defendant_key
+        FROM fact_crime_case
+        GROUP BY crime_case_key
+      )
+      SELECT
+          ct.crime_type,
+          ROUND(AVG(v.victim_age), 1) AS avg_victim_age,
+          ROUND(AVG(de.defendant_age), 1) AS avg_defendant_age
+      FROM case_level f
+      ANY INNER JOIN dim_crime_type ct
+        ON f.crime_type_key = ct.crime_type_key
+      ANY INNER JOIN dim_city ci
+        ON f.city_key = ci.city_key
+      ANY INNER JOIN dim_date d
+        ON f.crime_date_key = d.date_key
+      ANY INNER JOIN dim_victim v
+        ON f.victim_key = v.victim_key
+      ANY INNER JOIN dim_defendant de
+        ON f.defendant_key = de.defendant_key
+      {WHERE}
+      GROUP BY ct.crime_type
+      ORDER BY avg_victim_age DESC
+    """)
+    if not demo.empty:
+        long = demo.melt(
+            id_vars="crime_type",
+            value_vars=["avg_victim_age", "avg_defendant_age"],
+            var_name="group", value_name="age"
+        )
+        long["group"] = long["group"].map({
+            "avg_victim_age": "Victim",
+            "avg_defendant_age": "Defendant"
+        })
+        fig = px.bar(
+            long, x="crime_type", y="age", color="group", barmode="group",
+            color_discrete_sequence=[RED, NAVY],
+            labels={"crime_type": "", "age": "Average Age", "group": ""},
+        )
+        fig.update_xaxes(tickangle=-35)
+        show_chart(fig, 570, legend=True)
+
+    st.markdown("###  Key Insights")
+    if (
+        isinstance(rates, pd.DataFrame)
+        and not rates.empty
+        and "crime_type" in rates.columns
+        and "imprisonment_rate_pct" in rates.columns
+    ):
+        high_rate = rates.iloc[0]
+        low_rate = rates.iloc[-1]
+        insight(
+            "Highest imprisonment rate",
+            f"<b>{high_rate.crime_type}</b> has the highest imprisonment rate at <b>{high_rate.imprisonment_rate_pct:.2f}%</b>."
+        )
+        insight(
+            "Lowest imprisonment rate",
+            f"<b>{low_rate.crime_type}</b> has the lowest imprisonment rate at <b>{low_rate.imprisonment_rate_pct:.2f}%</b>."
+        )
+    if not release.empty:
+        r = release.iloc[0]
+        insight(
+            "Most common release reason",
+            f"<b>{r.release_reason}</b> is the most frequent release reason with <b>{int(r.released_cases):,} cases</b>."
+        )
