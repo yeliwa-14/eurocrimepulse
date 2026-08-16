@@ -11,7 +11,7 @@ Continuous Generator → Kafka → Spark Structured Streaming → HDFS Bronze/Si
 - `streaming/` — generator, Kafka producer and Spark streaming jobs
 - `warehouse/` — Gold Star Schema builder
 - `clickhouse/` — ClickHouse setup and loader
-- `ml/` — production ML pipeline
+- `ml/` — production ML pipeline (Clustring)
 - `dashboard/` — Streamlit dashboard
 - `airflow/` — Airflow DAG
 - `monitoring/` — health checks
