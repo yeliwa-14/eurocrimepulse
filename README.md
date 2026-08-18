@@ -17,4 +17,4 @@ Continuous Generator → Kafka → Spark Structured Streaming → HDFS Bronze/Si
 - `monitoring/` — health checks
 - `scripts/` — project start/stop helpers
 
-Production runtime is Docker/Linux. See `FINAL_RUNBOOK.md`.
+Production runtime is Docker/Linux. See `FINAL_RUNBOOK.md'.
