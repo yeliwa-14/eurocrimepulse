@@ -4,6 +4,10 @@ End-to-end crime data engineering platform:
 
 Continuous Generator → Kafka → Spark Structured Streaming → HDFS Bronze/Silver/Gold layers
 → Star Schema Warehouse → ClickHouse → Analytics/ML → Streamlit.
+## 🎥 Demo
+
+[Watch the full project demo](https://drive.google.com/file/d/11Z93jqm7_0wBkypEYluClIMePQCiTtc2/view?usp=drivesdk)
+
 
 ## Project structure
 
